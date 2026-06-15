@@ -6,6 +6,15 @@
 [![VAAST Xtension](https://img.shields.io/badge/VAAST-Xtension-7C3AED)](https://xtension.xtrinel.com)
 [![Tier: Free](https://img.shields.io/badge/tier-free-gray)](https://xtension.xtrinel.com)
 
+## What's new in v0.2.0
+
+- Full tab UI with live-updating analysis results
+- No longer requires an active scan session
+- Real-time updates as proxy captures arrive (debounced 1.5s)
+- Collapsible finding sections
+- Manual refresh button
+- "Updated Xs ago" live timestamp
+
 ## What it does
 
 Just as the Mesozoic era left a fossil record that reveals patterns across deep time, Mezo reads your session's capture history to surface what keeps recurring, what's clustered around errors, and what's unexpectedly large. It runs three forensic passes across your proxy captures and writes findings directly to the VAAST results pane.

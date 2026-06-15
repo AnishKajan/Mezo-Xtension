@@ -1,4 +1,4 @@
-interface Capture {
+interface ProxyCapture {
   id: string;
   timestamp: string;
   method: string;
@@ -6,136 +6,179 @@ interface Capture {
   response_status: number | null;
   response_body: string | null;
   request_body: string | null;
+  response_headers: string | null;
   duration_ms: number | null;
 }
 
-interface Finding {
-  category: string;
-  severity: 'high' | 'medium' | 'low';
-  title: string;
-  description: string;
-  evidence: string;
+interface RepeatedHostFinding { host: string; count: number; urls: string[]; severity: 'medium' }
+interface ErrorClusterFinding { host: string; count: number; statusCodes: number[]; severity: 'low' }
+interface AnomalousResponseFinding { url: string; size: number; mean: number; stdDev: number; severity: 'high' }
+
+interface MezoState {
+  captures: ProxyCapture[];
+  results: {
+    repeatedHosts: RepeatedHostFinding[];
+    errorClusters: ErrorClusterFinding[];
+    anomalousResponses: AnomalousResponseFinding[];
+  };
+  lastUpdated: number | null;
+}
+
+function getHost(url: string): string {
+  try { return new URL(url).hostname; } catch { return url; }
+}
+
+function analyze(captures: ProxyCapture[]): MezoState['results'] {
+  // Pass 1: Repeated Host Probing
+  const hostMap = new Map<string, string[]>();
+  for (const c of captures) {
+    const host = getHost(c.url);
+    if (!hostMap.has(host)) hostMap.set(host, []);
+    hostMap.get(host)!.push(c.url);
+  }
+  const repeatedHosts: RepeatedHostFinding[] = [...hostMap.entries()]
+    .filter(([, urls]) => urls.length >= 5)
+    .map(([host, urls]) => ({ host, count: urls.length, urls: [...new Set(urls)].slice(0, 3), severity: 'medium' }))
+    .sort((a, b) => b.count - a.count);
+
+  // Pass 2: Error Response Clustering
+  const errorMap = new Map<string, Set<number>>();
+  for (const c of captures) {
+    if ((c.response_status || 0) >= 400) {
+      const host = getHost(c.url);
+      if (!errorMap.has(host)) errorMap.set(host, new Set());
+      errorMap.get(host)!.add(c.response_status!);
+    }
+  }
+  const errorClusters: ErrorClusterFinding[] = [];
+  for (const [host, codes] of errorMap) {
+    const count = captures.filter(c => getHost(c.url) === host && (c.response_status || 0) >= 400).length;
+    if (count >= 3) errorClusters.push({ host, count, statusCodes: [...codes].sort(), severity: 'low' });
+  }
+  errorClusters.sort((a, b) => b.count - a.count);
+
+  // Pass 3: Anomalous Response Size
+  const sizes: { url: string; size: number }[] = [];
+  for (const c of captures) {
+    let size = 0;
+    if (c.response_body) size = c.response_body.length;
+    else if (c.response_headers) {
+      const m = c.response_headers.match(/content-length['":\s]+(\d+)/i);
+      if (m) size = parseInt(m[1]);
+    }
+    if (size > 0) sizes.push({ url: c.url, size });
+  }
+
+  const anomalousResponses: AnomalousResponseFinding[] = [];
+  if (sizes.length >= 3) {
+    const mean = sizes.reduce((s, x) => s + x.size, 0) / sizes.length;
+    const stdDev = Math.sqrt(sizes.reduce((s, x) => s + (x.size - mean) ** 2, 0) / sizes.length);
+    if (stdDev > 0) {
+      for (const s of sizes) {
+        if (s.size > mean + 2 * stdDev) {
+          anomalousResponses.push({ url: s.url, size: s.size, mean: Math.round(mean), stdDev: Math.round(stdDev), severity: 'high' });
+        }
+      }
+    }
+  }
+  anomalousResponses.sort((a, b) => b.size - a.size);
+
+  return { repeatedHosts, errorClusters, anomalousResponses };
+}
+
+function formatSize(bytes: number): string {
+  return bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KB` : `${bytes} bytes`;
+}
+
+function render(container: HTMLElement, state: MezoState) {
+  const uniqueHosts = new Set(state.captures.map(c => getHost(c.url))).size;
+  const totalFindings = state.results.repeatedHosts.length + state.results.errorClusters.length + state.results.anomalousResponses.length;
+
+  container.innerHTML = `
+    <div style="padding:20px;color:#fff;font-family:system-ui,-apple-system,sans-serif;font-size:13px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+        <div>
+          <h2 style="margin:0;font-size:18px;color:#fff;font-weight:700">Mezo</h2>
+          <p style="margin:2px 0 0;color:#9CA3AF;font-size:11px">Scan history forensics</p>
+        </div>
+        <div style="text-align:right">
+          <span id="mezo-updated" style="color:#9CA3AF;font-size:10px">${state.lastUpdated ? 'Updated just now' : ''}</span>
+          <button id="mezo-refresh" style="display:block;margin-top:4px;padding:4px 10px;background:#1F2937;border:1px solid #374151;border-radius:4px;color:#9CA3AF;font-size:10px;cursor:pointer">Refresh</button>
+        </div>
+      </div>
+
+      ${state.captures.length === 0
+        ? '<p style="color:#9CA3AF;font-size:12px;padding:24px;text-align:center;background:#111;border-radius:6px">No proxy captures yet. Start the proxy and send requests to begin analysis.</p>'
+        : `<p style="color:#10B981;font-size:11px;margin:0 0 16px">Analyzing ${state.captures.length} captures across ${uniqueHosts} hosts · ${totalFindings} findings</p>`}
+
+      ${renderSection('Repeated Host Activity', '#F59E0B', state.results.repeatedHosts, (f: RepeatedHostFinding) =>
+        `<div style="display:flex;justify-content:space-between;padding:8px;font-size:11px"><span style="color:#fff">${f.host}</span><span style="color:#F59E0B">${f.count} requests</span></div>`
+      , 'No repeated host patterns detected.')}
+
+      ${renderSection('Error Clusters', '#3B82F6', state.results.errorClusters, (f: ErrorClusterFinding) =>
+        `<div style="display:flex;justify-content:space-between;padding:8px;font-size:11px"><span style="color:#fff">${f.host}</span><span style="color:#3B82F6">${f.count} errors (${f.statusCodes.join(', ')})</span></div>`
+      , 'No error clusters detected.')}
+
+      ${renderSection('Anomalous Response Sizes', '#EF4444', state.results.anomalousResponses, (f: AnomalousResponseFinding) =>
+        `<div style="display:flex;justify-content:space-between;padding:8px;font-size:11px"><span style="color:#fff;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${f.url}</span><span style="color:#EF4444">${formatSize(f.size)} (mean: ${formatSize(f.mean)})</span></div>`
+      , 'No anomalous response sizes detected.')}
+
+      <p style="color:#4B5563;font-size:10px;margin:24px 0 0;text-align:center">Mezo v0.2.0 · by AnishKajan · <a href="https://github.com/AnishKajan/Mezo-Xtension" target="_blank" style="color:#6B7280;text-decoration:underline">View Source</a></p>
+    </div>`;
+}
+
+function renderSection(title: string, color: string, items: any[], rowFn: (f: any) => string, emptyMsg: string): string {
+  return `
+    <div style="margin-bottom:12px;background:#111;border:1px solid #1F2937;border-radius:6px;overflow:hidden">
+      <div style="padding:10px 12px;border-bottom:1px solid #1F2937;cursor:pointer" onclick="this.nextElementSibling.style.display=this.nextElementSibling.style.display==='none'?'block':'none'">
+        <span style="font-size:11px;text-transform:uppercase;letter-spacing:0.05em;color:${color}">${title}</span>
+        <span style="float:right;color:#6B7280;font-size:10px">${items.length}</span>
+      </div>
+      <div style="padding:${items.length ? '4px' : '12px'}">
+        ${items.length ? items.map(rowFn).join('') : `<p style="color:#6B7280;font-size:11px;margin:0">${emptyMsg}</p>`}
+      </div>
+    </div>`;
 }
 
 export function register(api: any) {
-  api.ui.registerTab('mezo', 'Mezo', (container: HTMLElement) => {
-    container.innerHTML = `
-      <div style="padding:24px;color:#e2e8f0;font-family:system-ui">
-        <h2 style="color:#7C3AED;margin:0 0 4px;font-size:18px">Mezo</h2>
-        <p style="color:#94a3b8;font-size:12px;margin:0 0 20px">Scan History Forensics</p>
-        <button id="mz-analyze" style="padding:8px 16px;background:#7C3AED;border:none;border-radius:6px;color:white;font-size:13px;cursor:pointer;margin-bottom:16px">Analyze Session History</button>
-        <div id="mz-results" style="border:1px solid #334155;border-radius:8px;padding:16px;min-height:250px">
-          <p style="color:#64748b;font-size:12px;margin:0">Click Analyze to run three forensic passes across your captured traffic: repeated probing detection, error clustering, and response size anomalies.</p>
-        </div>
-      </div>`;
+  try {
+    const state: MezoState = { captures: [], results: { repeatedHosts: [], errorClusters: [], anomalousResponses: [] }, lastUpdated: null };
 
-    const analyzeBtn = container.querySelector('#mz-analyze') as HTMLButtonElement;
-    const results = container.querySelector('#mz-results') as HTMLDivElement;
+    api.ui.registerTab('mezo', 'Mezo', (container: HTMLElement) => {
+      let debounceTimer: any = null;
 
-    analyzeBtn.addEventListener('click', async () => {
-      analyzeBtn.disabled = true;
-      analyzeBtn.textContent = 'Analyzing...';
-      results.innerHTML = '';
-
-      const captures: Capture[] = await api.proxy.getCaptures();
-      if (captures.length === 0) {
-        results.innerHTML = '<p style="color:#64748b;font-size:12px;margin:0">No captures in session. Use the Proxy tab to capture traffic first.</p>';
-        analyzeBtn.disabled = false;
-        analyzeBtn.textContent = 'Analyze Session History';
-        return;
+      function runAnalysis() {
+        state.results = analyze(state.captures);
+        state.lastUpdated = Date.now();
+        render(container, state);
+        container.querySelector('#mezo-refresh')?.addEventListener('click', () => runAnalysis());
       }
 
-      const findings: Finding[] = [];
-      const sections: string[] = [];
+      // Initial load
+      api.proxy.getCaptures().then((captures: ProxyCapture[]) => {
+        state.captures = captures || [];
+        runAnalysis();
+      }).catch(() => {
+        container.innerHTML = '<p style="color:#EF4444;padding:24px;font-size:12px">[Mezo v0.2.0] Could not load proxy captures. Is the proxy running?</p>';
+      });
 
-      // Pass 1: Repeated Host Probing
-      const hostCounts = new Map<string, number>();
-      for (const c of captures) {
-        try {
-          const host = new URL(c.url).hostname;
-          hostCounts.set(host, (hostCounts.get(host) || 0) + 1);
-        } catch {}
-      }
-      const repeatedHosts = [...hostCounts.entries()].filter(([, count]) => count >= 5).sort((a, b) => b[1] - a[1]);
+      // Live updates
+      api.proxy.onCapture((capture: ProxyCapture) => {
+        state.captures.push(capture);
+        if (debounceTimer) clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => runAnalysis(), 1500);
+      });
 
-      if (repeatedHosts.length > 0) {
-        sections.push(`
-          <div style="margin-bottom:16px">
-            <h3 style="color:#7C3AED;font-size:13px;margin:0 0 8px">Repeated Host Probing</h3>
-            ${repeatedHosts.map(([host, count]) => `
-              <div style="padding:8px;background:#0f172a;border-radius:4px;margin-bottom:4px;font-size:11px">
-                <span style="color:#e2e8f0">${host}</span>
-                <span style="color:#7C3AED;float:right">${count} requests</span>
-              </div>`).join('')}
-          </div>`);
-        for (const [host, count] of repeatedHosts) {
-          findings.push({ category: 'Behavioral Pattern', severity: 'low', title: `Repeated probing: ${host} (${count}x)`, description: `Host received ${count} requests in this session — may indicate automated enumeration.`, evidence: `${count} requests to ${host}` });
+      // "Updated Xs ago" display refresh
+      setInterval(() => {
+        const el = container.querySelector('#mezo-updated');
+        if (el && state.lastUpdated) {
+          const secs = Math.round((Date.now() - state.lastUpdated) / 1000);
+          el.textContent = secs < 5 ? 'Updated just now' : `Updated ${secs}s ago`;
         }
-      }
-
-      // Pass 2: Error Response Clustering
-      const errorCaptures = captures.filter(c => (c.response_status || 0) >= 400);
-      const errorsByUrl = new Map<string, number>();
-      for (const c of errorCaptures) {
-        errorsByUrl.set(c.url, (errorsByUrl.get(c.url) || 0) + 1);
-      }
-      const errorClusters = [...errorsByUrl.entries()].filter(([, count]) => count >= 2).sort((a, b) => b[1] - a[1]);
-
-      if (errorClusters.length > 0) {
-        sections.push(`
-          <div style="margin-bottom:16px">
-            <h3 style="color:#f87171;font-size:13px;margin:0 0 8px">Error Response Clustering</h3>
-            ${errorClusters.map(([url, count]) => `
-              <div style="padding:8px;background:#0f172a;border-radius:4px;margin-bottom:4px;font-size:11px">
-                <span style="color:#e2e8f0;word-break:break-all">${url}</span>
-                <span style="color:#f87171;float:right">${count} errors</span>
-              </div>`).join('')}
-          </div>`);
-        for (const [url, count] of errorClusters) {
-          findings.push({ category: 'Error Cluster', severity: 'medium', title: `Error cluster: ${url} (${count} errors)`, description: `Endpoint returned errors ${count} times — may indicate broken tool calls or hallucinated endpoints.`, evidence: `${count} error responses from ${url}` });
-        }
-      }
-
-      // Pass 3: Anomalous Response Size
-      const sizes = captures.filter(c => c.response_body).map(c => ({ url: c.url, size: (c.response_body || '').length }));
-      if (sizes.length >= 3) {
-        const mean = sizes.reduce((s, x) => s + x.size, 0) / sizes.length;
-        const stddev = Math.sqrt(sizes.reduce((s, x) => s + (x.size - mean) ** 2, 0) / sizes.length);
-        const outliers = sizes.filter(x => Math.abs(x.size - mean) > 2 * stddev);
-
-        if (outliers.length > 0) {
-          sections.push(`
-            <div style="margin-bottom:16px">
-              <h3 style="color:#FFEF00;font-size:13px;margin:0 0 8px">Anomalous Response Size</h3>
-              <p style="color:#64748b;font-size:10px;margin:0 0 6px">Mean: ${Math.round(mean)} bytes, StdDev: ${Math.round(stddev)} bytes</p>
-              ${outliers.slice(0, 5).map(o => `
-                <div style="padding:8px;background:#0f172a;border-radius:4px;margin-bottom:4px;font-size:11px">
-                  <span style="color:#e2e8f0;word-break:break-all">${o.url}</span>
-                  <span style="color:#FFEF00;float:right">${o.size} bytes</span>
-                </div>`).join('')}
-            </div>`);
-          for (const o of outliers.slice(0, 5)) {
-            findings.push({ category: 'Size Anomaly', severity: 'medium', title: `Anomalous response: ${o.url} (${o.size} bytes)`, description: `Response size is ${Math.round(Math.abs(o.size - mean) / stddev)}x standard deviations from mean — may indicate data exfiltration or prompt injection output.`, evidence: `${o.size} bytes (mean: ${Math.round(mean)}, stddev: ${Math.round(stddev)})` });
-          }
-        }
-      }
-
-      // Write findings
-      for (const f of findings) {
-        api.scanner.addFinding(f);
-      }
-
-      // Render
-      if (sections.length === 0) {
-        results.innerHTML = `<p style="color:#64748b;font-size:12px;margin:0">No patterns detected across ${captures.length} captures. Session traffic appears normal.</p>`;
-      } else {
-        results.innerHTML = `
-          <p style="color:#94a3b8;font-size:11px;margin:0 0 12px">Analyzed ${captures.length} captures · ${findings.length} findings</p>
-          ${sections.join('')}`;
-      }
-
-      analyzeBtn.disabled = false;
-      analyzeBtn.textContent = 'Analyze Session History';
+      }, 5000);
     });
-  });
+  } catch (e) {
+    console.error('[Mezo v0.2.0]', e);
+  }
 }
